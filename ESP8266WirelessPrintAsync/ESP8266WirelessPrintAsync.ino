@@ -5,15 +5,27 @@
   #include <ESP8266mDNS.h>        // https://github.com/esp8266/Arduino/tree/master/libraries/ESP8266mDNS
 #elif defined(ESP32)
   #include <ESPmDNS.h>
+  #include <Update.h>
+  #include <Hash.h>
 #endif
 #include <ArduinoJson.h>          // https://github.com/bblanchon/ArduinoJson (for implementing a subset of the OctoPrint API)
 #include <DNSServer.h>
 #include "StorageFS.h"
 #include <ESPAsyncWebServer.h>    // https://github.com/me-no-dev/ESPAsyncWebServer
 #include <ESPAsyncWiFiManager.h>  // https://github.com/alanswx/ESPAsyncWiFiManager/
+#include <AsyncElegantOTA.h>      // https://github.com/ayushsharma82/AsyncElegantOTA
 #include <SPIFFSEditor.h>
 
 #include "CommandQueue.h"
+
+// On ESP8266 use the normal Serial() for now, but name it PrinterSerial for compatibility with ESP32
+// On ESP32, use Serial1 (rather than the normal Serial0 which prints stuff during boot that confuses the printer)
+#ifdef ESP8266
+#define PrinterSerial Serial
+#endif
+#ifdef ESP32
+HardwareSerial PrinterSerial(1);
+#endif
 
 WiFiServer telnetServer(23);
 WiFiClient serverClient;
@@ -32,10 +44,13 @@ DNSServer dns;
 #define PRINTER_RX_BUFFER_SIZE 0        // This is printer firmware 'RX_BUFFER_SIZE'. If such parameter is unknown please use 0
 #define TEMPERATURE_REPORT_INTERVAL 2   // Ask the printer for its temperatures status every 2 seconds
 #define KEEPALIVE_INTERVAL 2500         // Marlin defaults to 2 seconds, get a little of margin
-const uint32_t serialBauds[] = { 115200, 250000, 500000, 1000000, 57600 };   // Marlin valid bauds (removed very low bauds; roughly ordered by popularity to speed things up)
+const uint32_t serialBauds[] = { 115200, 250000, 57600 };    // Marlin valid bauds (removed very low bauds; roughly ordered by popularity to speed things up)
 
 #define API_VERSION     "0.1"
 #define VERSION         "1.3.10"
+
+// The sketch on the ESP
+bool ESPrestartRequired;  // Set this flag in the callbacks to restart ESP
 
 // Information from M115
 String fwMachineType = "Unknown";
@@ -90,7 +105,9 @@ inline String IpAddress2String(const IPAddress& ipAddress) {
 }
 
 inline void setLed(const bool status) {
-  digitalWrite(LED_BUILTIN, status ? LOW : HIGH);   // Note: LOW turn the LED on
+  #if defined(LED_BUILTIN)
+    digitalWrite(LED_BUILTIN, status ? LOW : HIGH);   // Note: LOW turn the LED on
+  #endif
 }
 
 inline void telnetSend(const String line) {
@@ -347,7 +364,15 @@ bool M115ExtractBool(const String response, const String field, const bool onErr
 }
 
 inline String getDeviceName() {
-  return fwMachineType + " (" + String(ESP.getChipId(), HEX) + ")";
+  #if defined(ESP8266)
+    return fwMachineType + " (" + String(ESP.getChipId(), HEX) + ")";
+  #elif defined(ESP32)
+    uint64_t chipid = ESP.getEfuseMac();
+
+    return fwMachineType + " (" + String((uint16_t)(chipid >> 32), HEX) + String((uint32_t)chipid, HEX) + ")";
+  #else
+    #error Unimplemented chip!
+  #endif
 }
 
 void mDNSInit() {
@@ -388,7 +413,12 @@ bool detectPrinter() {
 
     case 10:
       // Initialize baud and send a request to printezr
-      Serial.begin(serialBauds[serialBaudIndex]);
+      #ifdef ESP8266
+      PrinterSerial.begin(serialBauds[serialBaudIndex]); // See note above; we have actually renamed Serial to Serial1
+      #endif
+      #ifdef ESP32
+      PrinterSerial.begin(115200 ,SERIAL_8N1, 32, 33); // gpio32 = rx, gpio33 = tx
+      #endif
       telnetSend("Connecting at " + String(serialBauds[serialBaudIndex]));
       commandQueue.push("M115"); // M115 - Firmware Info
       printerDetectionState = 20;
@@ -474,7 +504,9 @@ inline String stringify(bool value) {
 }
 
 void setup() {
-  pinMode(LED_BUILTIN, OUTPUT);     // Initialize the LED_BUILTIN pin as an output
+  #if defined(LED_BUILTIN)
+    pinMode(LED_BUILTIN, OUTPUT);     // Initialize the LED_BUILTIN pin as an output
+  #endif
 
   #ifdef USE_FAST_SD
     storageFS.begin(true);
@@ -488,6 +520,9 @@ void setup() {
 
   // Wait for connection
   setLed(true);
+  #ifdef OTA_UPDATES
+    AsyncElegantOTA.begin(&server);
+  #endif
   AsyncWiFiManager wifiManager(&server, &dns);
   // wifiManager.resetSettings();   // Uncomment this to reset the settings on the device, then you will need to reflash with USB and this commented out!
   wifiManager.setDebugOutput(false);  // So that it does not send stuff to the printer that the printer does not understand
@@ -497,8 +532,15 @@ void setup() {
   telnetServer.begin();
   telnetServer.setNoDelay(true);
 
-  if (storageFS.activeSPIFFS())
-    server.addHandler(new SPIFFSEditor());
+  if (storageFS.activeSPIFFS()) {
+    #if defined(ESP8266)
+      server.addHandler(new SPIFFSEditor());
+    #elif defined(ESP32)
+      server.addHandler(new SPIFFSEditor(SPIFFS));
+    #else
+      #error Unsupported SOC
+    #endif
+  }
 
   initUploadedFilename();
 
@@ -509,19 +551,26 @@ void setup() {
 
   // Main page
   server.on("/", HTTP_GET, [](AsyncWebServerRequest * request) {
+      String uploadedName = uploadedFullname;
+  uploadedName.replace("/", "");
     String message = "<h1>" + getDeviceName() + "</h1>"
                      "<form enctype=\"multipart/form-data\" action=\"/api/files/local\" method=\"POST\">\n"
                      "<p>You can also print from the command line using curl:</p>\n"
                      "<pre>curl -F \"file=@/path/to/some.gcode\" -F \"print=true\" " + IpAddress2String(WiFi.localIP()) + "/api/files/local</pre>\n"
-                     "Choose a file to upload: <input name=\"file\" type=\"file\"/><br/>\n"
+                     "Choose a file to upload: <input name=\"file\" type=\"file\" accept=\".gcode,.GCODE,.gco,.GCO\"/><br/>\n"
                      "<input type=\"checkbox\" name=\"print\" id = \"printImmediately\" value=\"true\" checked>\n"
                      "<label for = \"printImmediately\">Print Immediately</label><br/>\n"
                      "<input type=\"submit\" value=\"Upload\" />\n"
                      "</form>"
-                     "<p><script>\nfunction startFunction(command) {\n  var xmlhttp = new XMLHttpRequest();\n  xmlhttp.open(\"POST\", \"/api/job\");\n  xmlhttp.setRequestHeader(\"Content-Type\", \"application/json\");\n  xmlhttp.send(JSON.stringify({command:command}));\n}\n</script>\n<button onclick=\"startFunction(\'cancel\')\">Cancel active print</button>\n<button onclick=\"startFunction(\'start\')\">Print last uploaded file</button></p>\n"
-                     "<p><a href=\"/download\">Download</a></p>"
+                     "<p><script>\nfunction startFunction(command) {\n  var xmlhttp = new XMLHttpRequest();\n  xmlhttp.open(\"POST\", \"/api/job\");\n  xmlhttp.setRequestHeader(\"Content-Type\", \"application/json\");\n  xmlhttp.send(JSON.stringify({command:command}));\n}\n</script>\n<button onclick=\"startFunction(\'cancel\')\">Cancel active print</button>\n<button onclick=\"startFunction(\'start\')\">Print " + uploadedName + "</button></p>\n"
+                     "<p><a href=\"/download\">Download " + uploadedName + "</a></p>"
                      "<p><a href=\"/info\">Info</a></p>"
-                     "<p>WirelessPrinting <a href=\"https://github.com/probonopd/WirelessPrinting/commit/" + SKETCH_VERSION + "\">" + SKETCH_VERSION + "</a></p>";
+                     "<hr>"
+                     "<p>WirelessPrinting <a href=\"https://github.com/probonopd/WirelessPrinting/commit/" + SKETCH_VERSION + "\">" + SKETCH_VERSION + "</a></p>\n"
+                    #ifdef OTA_UPDATES
+                      "<p>OTA Update Device: <a href=\"/update\">Click Here</a></p>"
+                    #endif
+                     ;
     request->send(200, "text/html", message);
   });
 
@@ -751,7 +800,7 @@ void setup() {
 
       if (!index)
         content = "";
-      for (int i = 0; i < len; ++i)
+      for (size_t i = 0; i < len; ++i)
         content += (char)data[i];
       if (content.length() >= total) {
         DynamicJsonDocument doc(1024);
@@ -784,14 +833,6 @@ void setup() {
     request->send(200, "text/plain", "Received");
   }, handleUpload);
 
-  // Web updates
-  server.on("/update", HTTP_GET, uploadfwRequest);
-  // handler for the /update form POST (once file upload finishes)
-  server.on("/upload", HTTP_POST, [](AsyncWebServerRequest *request){
-      request->send(200);
-    }, handle_update_progress_cb);
-  
-
   server.begin();
 
   #ifdef OTA_UPDATES
@@ -804,21 +845,113 @@ void setup() {
   #endif
 }
 
+
+
+inline void restartSerialTimeout() {
+  serialReceiveTimeoutTimer = millis() + KEEPALIVE_INTERVAL;
+}
+
+void SendCommands() {
+  String command = commandQueue.peekSend();  //gets the next command to be sent
+  if (command != "") {
+    bool noResponsePending = commandQueue.isAckEmpty();
+    if (noResponsePending || printerUsedBuffer < PRINTER_RX_BUFFER_SIZE * 3 / 4) {  // Let's use no more than 75% of printer RX buffer
+      if (noResponsePending)
+        restartSerialTimeout();   // Receive timeout has to be reset only when sending a command and no pending response is expected
+      PrinterSerial.println(command);          // Send to 3D Printer
+      printerUsedBuffer += command.length();
+      lastCommandSent = command;
+      commandQueue.popSend();
+
+      telnetSend(">" + command);
+    }
+  }
+}
+
+void ReceiveResponses() {
+  static int lineStartPos;
+  static String serialResponse;
+
+  while (PrinterSerial.available()) {
+    char ch = (char)PrinterSerial.read();
+    if (ch != '\n')
+      serialResponse += ch;
+    else {
+      bool incompleteResponse = false;
+      String responseDetail = "";
+
+      if (serialResponse.startsWith("ok", lineStartPos)) {
+        if (lastCommandSent.startsWith(TEMP_COMMAND))
+          parseTemperatures(serialResponse);
+        else if (fwAutoreportTempCap && lastCommandSent.startsWith(AUTOTEMP_COMMAND))
+          autoreportTempEnabled = (lastCommandSent[6] != '0');
+
+        unsigned int cmdLen = commandQueue.popAcknowledge().length();     // Go on with next command
+        printerUsedBuffer = max(printerUsedBuffer - cmdLen, 0u);
+        responseDetail = "ok";
+      }
+      else if (printerConnected) {
+        if (parseTemperatures(serialResponse))
+          responseDetail = "autotemp";
+        else if (parsePosition(serialResponse))
+          responseDetail = "position";
+        else if (serialResponse.startsWith("echo:busy"))
+          responseDetail = "busy";
+        else if (serialResponse.startsWith("echo: cold extrusion prevented")) {
+          // To do: Pause sending gcode, or do something similar
+          responseDetail = "cold extrusion";
+        }
+        else if (serialResponse.startsWith("Error:")) {
+          cancelPrint = true;
+          responseDetail = "ERROR";
+        }
+        else {
+          incompleteResponse = true;
+          responseDetail = "wait more";
+        }
+      } else {
+          incompleteResponse = true;
+          responseDetail = "discovering";
+      }
+
+      int responseLength = serialResponse.length();
+      telnetSend("<" + serialResponse.substring(lineStartPos, responseLength) + "#" + responseDetail + "#");
+      if (incompleteResponse)
+        lineStartPos = responseLength;
+      else {
+        lastReceivedResponse = serialResponse;
+        lineStartPos = 0;
+        serialResponse = "";
+      }
+      restartSerialTimeout();
+    }
+  }
+
+  if (!commandQueue.isAckEmpty() && (signed)(serialReceiveTimeoutTimer - millis()) <= 0) {  // Command has been lost by printer, buffer has been freed
+    if (printerConnected)
+      telnetSend("#TIMEOUT#");
+    else
+      commandQueue.clear();
+    lineStartPos = 0;
+    serialResponse = "";
+    restartSerialTimeout();
+  }
+}
+
+
 void loop() {
   #ifdef OTA_UPDATES
     //****************
     //* OTA handling *
     //****************
+    if (ESPrestartRequired) {  // check the flag here to determine if a restart is required
+      PrinterSerial.printf("Restarting ESP\n\r");
+      ESPrestartRequired = false;
+      ESP.restart();
+    }
+
     ArduinoOTA.handle();
   #endif
-
-  //****************
-  //* Web updates *
-  //****************
-  if (restartNow){
-    Serial.println("Restart");
-    ESP.restart();
-  }
 
   //********************
   //* Printer handling *
@@ -884,141 +1017,9 @@ void loop() {
       telnetCommand += ch;
     }
   }
-}
+    
+  #ifdef OTA_UPDATES
+    AsyncElegantOTA.loop();
+  #endif
 
-inline uint32_t restartSerialTimeout() {
-  serialReceiveTimeoutTimer = millis() + KEEPALIVE_INTERVAL;
-}
-
-void SendCommands() {
-  String command = commandQueue.peekSend();  //gets the next command to be sent
-  if (command != "") {
-    bool noResponsePending = commandQueue.isAckEmpty();
-    if (noResponsePending || printerUsedBuffer < PRINTER_RX_BUFFER_SIZE * 3 / 4) {  // Let's use no more than 75% of printer RX buffer
-      if (noResponsePending)
-        restartSerialTimeout();   // Receive timeout has to be reset only when sending a command and no pending response is expected
-      Serial.println(command);          // Send to 3D Printer
-      printerUsedBuffer += command.length();
-      lastCommandSent = command;
-      commandQueue.popSend();
-
-      telnetSend(">" + command);
-    }
-  }
-}
-
-void ReceiveResponses() {
-  static int lineStartPos;
-  static String serialResponse;
-
-  while (Serial.available()) {
-    char ch = (char)Serial.read();
-    if (ch != '\n')
-      serialResponse += ch;
-    else {
-      bool incompleteResponse = false;
-      String responseDetail = "";
-
-      if (serialResponse.startsWith("ok", lineStartPos)) {
-        if (lastCommandSent.startsWith(TEMP_COMMAND))
-          parseTemperatures(serialResponse);
-        else if (fwAutoreportTempCap && lastCommandSent.startsWith(AUTOTEMP_COMMAND))
-          autoreportTempEnabled = (lastCommandSent[6] != '0');
-
-        unsigned int cmdLen = commandQueue.popAcknowledge().length();     // Go on with next command
-        printerUsedBuffer = max(printerUsedBuffer - cmdLen, 0u);
-        responseDetail = "ok";
-      }
-      else if (printerConnected) {
-        if (parseTemperatures(serialResponse))
-          responseDetail = "autotemp";
-        else if (parsePosition(serialResponse))
-          responseDetail = "position";
-        else if (serialResponse.startsWith("echo:busy"))
-          responseDetail = "busy";
-        else if (serialResponse.startsWith("echo: cold extrusion prevented")) {
-          // To do: Pause sending gcode, or do something similar
-          responseDetail = "cold extrusion";
-        }
-        else if (serialResponse.startsWith("Error:")) {
-          cancelPrint = true;
-          responseDetail = "ERROR";
-        }
-        else {
-          incompleteResponse = true;
-          responseDetail = "wait more";
-        }
-      } else {
-          incompleteResponse = true;
-          responseDetail = "discovering";
-      }
-
-      int responseLength = serialResponse.length();
-      telnetSend("<" + serialResponse.substring(lineStartPos, responseLength) + "#" + responseDetail + "#");
-      if (incompleteResponse)
-        lineStartPos = responseLength;
-      else {
-        lastReceivedResponse = serialResponse;
-        lineStartPos = 0;
-        serialResponse = "";
-      }
-      restartSerialTimeout();
-    }
-  }
-
-  if (!commandQueue.isAckEmpty() && (signed)(serialReceiveTimeoutTimer - millis()) <= 0) {  // Command has been lost by printer, buffer has been freed
-    if (printerConnected)
-      telnetSend("#TIMEOUT#");
-    else
-      commandQueue.clear();
-    lineStartPos = 0;
-    serialResponse = "";
-    restartSerialTimeout();
-  }
-}
-
-const char upload_page[] PROGMEM = R"=====(
-<!DOCTYPE HTML>
-<HTML>
-  <HEAD>
-    <TITLE>Firmware upload example</TITLE>
-  </HEAD>
-  <BODY>
-    <H1>Choose .ino.bin file</H1>
-    <form id="uploadform" enctype="multipart/form-data" method="post" action="/upload">
-       <input id="fileupload" name="inobinfile" type="file" />
-       <input type="submit" value="submit" id="submit" />
-    </form>
-  </BODY>
-</HTML>
-)=====";
-
-void uploadfwRequest(AsyncWebServerRequest *request){
-  request->send_P(200, "text/html", upload_page);
-}
-
-static int restartNow = false;
-
-static void handle_update_progress_cb(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-  uint32_t free_space = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
-  if (!index){
-    Serial.println("Update");
-    Update.runAsync(true);
-    if (!Update.begin(free_space)) {
-      Update.printError(Serial);
-    }
-  }
-
-  if (Update.write(data, len) != len) {
-    Update.printError(Serial);
-  }
-
-  if (final) {
-    if (!Update.end(true)){
-      Update.printError(Serial);
-    } else {
-      restartNow = true;              //Set flag so main loop can issue restart call
-      Serial.println("Update complete");
-    }
-  }
 }

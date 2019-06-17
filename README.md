@@ -4,7 +4,7 @@
 
 Print wirelessly from [Cura](https://ultimaker.com/en/products/cura-software), [PrusaControl](http://prusacontrol.org/), or [Slic3r PE](https://github.com/prusa3d/Slic3r/releases) to your 3D printer connected to an [ESP8266](https://espressif.com/en/products/hardware/esp8266ex/overview) module.
 
-__UNDER DEVELOPMENT__. See [Issues](https://github.com/probonopd/WirelessPrinting/issues). Pull requests welcome!
+__UNDER DEVELOPMENT__. See [Issues](https://github.com/probonopd/WirelessPrinting/issues). Pull requests welcome! 
 
 ## Comparison with other printer hosts
 
@@ -17,56 +17,94 @@ __UNDER DEVELOPMENT__. See [Issues](https://github.com/probonopd/WirelessPrintin
 | No set-up needed | Set-up needed (full Linux operating system, hundreds of megabytes) | Only quick wireless network setup needed | 
 | No maintenance needed (other than replacing broken SD card slots) | High maintenance needed (OS updates) | Low maintenance needed (Firmware updates for bugfixes and new features) |
 | No extra power consumption | 2.5 W power consumption | Under 1 W power consumption |
-| No webcam | Webcam can be attached | No webcam |
+| No webcam | Webcam can be attached | ESP32 module with built-in camera (may be supported in the future) |
 | No notifications | Notifications, e.g., "print ready" | Notifications possible (send pull requests) |
 | Cumbersome for print farms (sneakernet) | Suitable for print farms (can be managed centrally) | Suitable for print farms (can be managed centrally, OctoPrint compatible protocol subset) |
 
 ## Hardware
 
-_Readymade, pre-assembled, flashed and tested hardware may be available, please contact me for information._
+WEMOS D1 mini modules can be used. Also, ESP32 modules can be used (e.g., TTGO-T1 with built-in microSD card slot).
 
-The ESP8266 module is connected with your 3D printer via the serial connection and to a SD card (acting as a cache during printing). You need to connect
-* TX, RX from your 3D printer to the ESP8266 module (__AUX-1__ header on RAMPS boards)
-* Power and GND from your 3D printer to the ESP8266 module (attention, the __AUX-1__ header on RAMPS boards has 5V while the ESP8266 needs 3.3V)
-* Optional: SD card shield to the ESP8266 module (a capacitor across the power pins of the SD card; SD shields have this). Using a SanDisk 2 GB card formatted with `mkfs.vfat` on Linux seems to work for me. If no SD card is connected, then the internal SPIFFS memory (3 MB) is used
-* A matching case for a WeMos D1 mini and microSD shield can be found at http://www.thingiverse.com/thing:2287618
+The WEMOS D1 mini module is connected with your 3D printer via the serial connection and to a SD card (acting as a cache during printing). You need to connect
+* TX, RX from your 3D printer to the WEMOS D1 mini module (__AUX-1__ header on RAMPS boards). Note: For ESP32, use GPIO32 = RX, GPIO33 = TX
+* Power and GND from your 3D printer to the WEMOS D1 mini module (attention, the __AUX-1__ header on RAMPS boards has 5V while the ESP8266 needs 3.3V but the WEMOS D1 mini has a voltage regulator)
+* Optional: SD card shield to the WEMOS D1 mini module (a capacitor across the power pins of the SD card; SD shields have this). Using a SanDisk 2 GB card formatted with `mkfs.vfat` on Linux seems to work for me. If no SD card is connected, then the internal SPIFFS memory (3 MB) is used. For TTGO-T1, the built-in microSD card slot is used if a card is inserted.
+* A matching case for a WEMOS D1 mini module and microSD shield can be found at http://www.thingiverse.com/thing:2287618
 
 ## esp8266/Arduino sketch
 
-The [esp8266/Arduino](https://github.com/esp8266/Arduino) sketch `ESP8266WirelessPrintAsync.ino` is uploaded to a ESP8266 module. As or July 2017, this code compiled on Arduino hourly and esp8266/Arduino git master. See `.travis.yml` for how this is compiled on Travis CI.
+The [esp8266/Arduino](https://github.com/esp8266/Arduino) sketch `ESP8266WirelessPrintAsync.ino` is uploaded to a ESP8266 module. See `.travis.yml` for how this is compiled on Travis CI.
 
 ### Building
 
 Pre-built binaries are available for download on [GitHub Releases](https://github.com/probonopd/WirelessPrinting/releases).
 
-The following external libraries need to be installed:
+The following build procedure works on Linux:
 
 ```
+sudo su
+sudo apt-get install python-serial # Otherwise cannot build for ESP32
+
+BD=esp8266:esp8266:d1_mini:xtal=80,eesz=4M3M
+# or 
+BD=esp32:esp32:esp32
+
+wget http://downloads.arduino.cc/arduino-1.8.8-linux64.tar.xz
+tar xf arduino-*-linux64.tar.xz
+export PATH=$(readlink -f arduino-*/):$PATH
+
+arduino --pref "boardsmanager.additional.urls=http://arduino.esp8266.com/stable/package_esp8266com_index.json,https://dl.espressif.com/dl/package_esp32_index.json" --save-prefs
+if [[ "$BD" =~ "esp8266:esp8266:" ]]; then arduino --install-boards esp8266:esp8266:2.5.0 ; fi
+if [[ "$BD" =~ "esp32:esp32:" ]]; then arduino --install-boards esp32:esp32 ; fi
+arduino --pref "compiler.warning_level=all" --save-prefs
 mkdir -p $HOME/Arduino/libraries/
-cd $HOME
-git clone https://github.com/probonopd/WirelessPrinting
 cd $HOME/Arduino/libraries/
-# wget "https://raw.githubusercontent.com/probonopd/WirelessPrinting/master/.travis.yml" -O - | grep "git clone" | cut -d " " -f 4-99
-git clone https://github.com/me-no-dev/ESPAsyncWebServer
-git clone -o 991f855 https://github.com/me-no-dev/ESPAsyncTCP
-git clone -o 6734c16 https://github.com/alanswx/ESPAsyncWiFiManager
-( git clone -b 5.x https://github.com/bblanchon/ArduinoJson ; cd ArduinoJson ; git reset --hard ed98ea4 )
-git clone https://github.com/greiman/SdFat # SD long names support
-git clone https://github.com/me-no-dev/AsyncTCP # for ESP32
+git clone https://github.com/greiman/SdFat
+git clone -o 95dedf7 https://github.com/me-no-dev/ESPAsyncWebServer
+git clone -o 7e9ed22 https://github.com/me-no-dev/ESPAsyncTCP # for esp8266
+git clone https://github.com/me-no-dev/AsyncTCP # for esp32
+git clone -o 1c02154 https://github.com/alanswx/ESPAsyncWiFiManager
+( git clone -b 6.x https://github.com/bblanchon/ArduinoJson ; cd ArduinoJson ; git reset --hard 3df4efd )
 cd -
+
+git clone https://github.com/probonopd/WirelessPrinting/
+cd WirelessPrinting/
+
+VERSION=$(git rev-parse --short HEAD)
+HERE=$(readlink -f .)
+sed -i -e 's|#define SKETCH_VERSION ".*"|#define SKETCH_VERSION "'$VERSION'"|' $PWD/ESP8266WirelessPrintAsync/ESP8266WirelessPrintAsync.ino
+arduino --pref build.path=. --verify --verbose-build --board $BD ESP8266WirelessPrintAsync/ESP8266WirelessPrintAsync.ino
+BOARD=$(echo $BD | cut -d ":" -f 3)
+mv ./ESP8266WirelessPrintAsync.ino.bin "ESP8266WirelessPrintAsync_${BOARD}_${VERSION}.bin"
+
 ```
-### Flashing
+### Flashing from Linux
 
 Can be flashed via USB or (subsequently) over the air. You can use the Arduino IDE if you compiled yourself, or one of the following commands if you just want to flash a precompiled firmware.
 
+#### ESP8266
+
 ```
 # USB
-sudo chmod a+x /dev/ttyUSB0 ; /tmp/.mount_*/usr/bin/hardware/esp8266/esp8266/tools/esptool/esptool -vv -cd nodemcu -cb 921600 -cp /dev/ttyUSB0 -ca 0x00000 -cf ESP8266WirelessPrint*.bin
+sudo chmod a+rwx /dev/ttyUSB0 ; /tmp/.mount_*/usr/bin/hardware/esp8266/esp8266/tools/esptool/esptool -vv -cd nodemcu -cb 921600 -cp /dev/ttyUSB0 -ca 0x00000 -cf ESP8266WirelessPrint*.bin
 
 # Wireless
 wget -c "https://raw.githubusercontent.com/esp8266/Arduino/master/tools/espota.py"
 python espota.py -i 192.168.0.27 -p 8266 --auth= -f ESP8266WirelessPrint*.bin
 ```
+
+##### ESP32
+
+```
+# USB
+sudo apt install python-serial
+sudo chmod a+rwx /dev/ttyUSB0 ; python $HOME/.arduino15/packages/esp32/tools/esptool_py/2.6.0/esptool.py --chip esp32 --port /dev/ttyUSB0 write_flash 0x10000 ESP8266WirelessPrintAsync_esp32_*.bin
+
+# Wireless
+python $HOME/.arduino15/packages/esp32/hardware/esp32/1.0.1/tools/espota.py -i 192.168.0.16 -p 3232 --auth= -f ESP8266WirelessPrintAsync_esp32_*.bin
+```
+
+After the initial flashing, you can upload new versions of this firmware from the web interface without any further tools.
 
 ## Initial WiFi Configuration
 Following the instrucions in https://github.com/alanswx/ESPAsyncWiFiManager/ : 
