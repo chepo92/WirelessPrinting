@@ -434,7 +434,7 @@ bool detectPrinter() {
       PrinterSerial.begin(serialBauds[serialBaudIndex]); // See note above; we have actually renamed Serial to Serial1
       #endif
       #ifdef ESP32
-      PrinterSerial.begin(115200 ,SERIAL_8N1, 32, 33); // gpio32 = rx, gpio33 = tx
+      PrinterSerial.begin(serialBauds[serialBaudIndex], SERIAL_8N1, 32, 33); // gpio32 = rx, gpio33 = tx
       #endif
       telnetSend("Connecting at " + String(serialBauds[serialBaudIndex]));
       commandQueue.push("M115"); // M115 - Firmware Info
@@ -643,6 +643,11 @@ void setup() {
     request->send(response);    
   });
 
+  server.on("/api/login", HTTP_POST, [](AsyncWebServerRequest * request) {
+    // https://docs.octoprint.org/en/master/api/general.html#post--api-login
+    // https://github.com/fieldOfView/Cura-OctoPrintPlugin/issues/155#issuecomment-596109663
+    request->send(200, "application/json", "{}");  });
+
   server.on("/api/version", HTTP_GET, [](AsyncWebServerRequest * request) {
     // http://docs.octoprint.org/en/master/api/version.html
     request->send(200, "application/json", "{\r\n"
@@ -688,10 +693,14 @@ void setup() {
     lcd("Received");
     playSound();
 
-    if (request->hasParam("print", true))
-      startPrint = printerConnected && !isPrinting && uploadedFullname != "";
+    // We are not using
+    // if (request->hasParam("print", true))
+    // due to https://github.com/fieldOfView/Cura-OctoPrintPlugin/issues/156
+    
+    startPrint = printerConnected && !isPrinting && uploadedFullname != "";
 
-    request->send(200, "application/json", "{\r\n"
+    // OctoPrint sends 201 here; https://github.com/fieldOfView/Cura-OctoPrintPlugin/issues/155#issuecomment-596110996
+    request->send(201, "application/json", "{\r\n"
                                            "  \"files\": {\r\n"
                                            "    \"local\": {\r\n"
                                            "      \"name\": \"" + getUploadedFilename() + "\",\r\n"
@@ -965,7 +974,6 @@ void ReceiveResponses() {
   strip.Show(); 
 }
 
-
 void loop() {
   #ifdef OTA_UPDATES
     //****************
@@ -1017,7 +1025,6 @@ void loop() {
   SendCommands();
   ReceiveResponses();
 
-
   //*******************
   //* Telnet handling *
   //*******************
@@ -1048,5 +1055,4 @@ void loop() {
   #ifdef OTA_UPDATES
     AsyncElegantOTA.loop();
   #endif
-
 }
